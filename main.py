@@ -3,6 +3,8 @@ import logging
 import sys
 import requests
 import uuid
+import csv
+import os
 from datetime import datetime, timezone
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -22,15 +24,15 @@ CHECK_INTERVAL_SECONDS = 2
 RISK_FRACTION = 0.25
 MAX_ORDER_DOLLARS = 50.0
 
-# Fixed price ceiling — never trades above this regardless of time remaining
 PRICE_CEILING = 0.82
 PRICE_FLOOR = 0.25
 
-# Entry window — start watching at 8 minutes out, stop near expiry
 TRIGGER_AT_SECONDS = 480
 MIN_SECONDS_TO_TRADE = 25
 
 DRY_RUN = False
+
+RESULTS_FILE = "trade_results.csv"
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -51,7 +53,7 @@ session = requests.Session()
 def get_threshold(seconds_left: float):
     """
     Returns the BTC move threshold required to trigger a trade,
-    based on how much time is left. Ceiling is now fixed — it does
+    based on how much time is left. Ceiling is fixed — it does
     not rise as time runs out.
     Returns None if outside the trading window.
     """
@@ -82,6 +84,42 @@ def get_btc_price() -> float | None:
     except Exception as e:
         logger.error(f"Failed to fetch BTC price: {e}")
         return None
+
+
+def log_market_result(
+    ticker: str,
+    baseline: float,
+    final_btc: float,
+    variation: float,
+    side: str,
+    price: float,
+    filled: bool,
+    outcome: str
+):
+    """Log the result of a completed market to CSV"""
+    try:
+        file_exists = os.path.exists(RESULTS_FILE)
+        with open(RESULTS_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp", "ticker", "baseline_btc", "final_btc",
+                    "variation_pct", "side", "price", "filled", "outcome"
+                ])
+            writer.writerow([
+                datetime.now().isoformat(),
+                ticker,
+                round(baseline, 2),
+                round(final_btc, 2),
+                round(variation, 4),
+                side,
+                price,
+                filled,
+                outcome
+            ])
+        logger.info(f"📊 Logged result for {ticker}: {outcome} | BTC Δ={variation:.3f}% | side={side} | price={price}")
+    except Exception as e:
+        logger.error(f"Failed to log market result: {e}")
 
 
 # ====================== AUTH SIGNING ======================
@@ -170,7 +208,6 @@ def place_market_order(market_ticker: str, side: str, count: int, price: float) 
 
         price_cents = int(round(price * 100))
 
-        # Add a 5¢ buffer to cross the spread aggressively
         if side == "yes":
             if price_cents >= 95:
                 yes_price_cents = 99
@@ -241,7 +278,6 @@ def wait_for_fill(order_id: str, timeout_seconds: int = 10) -> bool:
                 logger.info(f"✅ Order fully filled: {filled} contracts")
                 return True
             elif status in ("canceled", "rejected", "executed"):
-                # "executed" with filled=0 means IOC was cancelled after no fill
                 if filled > 0:
                     logger.info(f"✅ Partially filled: {filled} contracts")
                     return True
@@ -261,6 +297,8 @@ def wait_for_fill(order_id: str, timeout_seconds: int = 10) -> bool:
 current_ticker = None
 market_baseline_btc = None
 traded_this_market = False
+last_side = None
+last_price = None
 
 
 # ===================== MAIN LOOP =====================
@@ -282,11 +320,38 @@ while True:
         time.sleep(CHECK_INTERVAL_SECONDS)
         continue
 
-    # Detect new market and reset state
+    # Detect new market — log previous result then reset state
     if ticker != current_ticker:
+
+        # Log the previous market's result before resetting
+        if current_ticker and market_baseline_btc:
+            final_btc = get_btc_price()
+            if final_btc:
+                final_variation = (final_btc - market_baseline_btc) / market_baseline_btc * 100
+                if last_side:
+                    outcome = "win" if (
+                        (last_side == "yes" and final_variation > 0) or
+                        (last_side == "no" and final_variation < 0)
+                    ) else "loss"
+                else:
+                    outcome = "no_trade"
+                log_market_result(
+                    ticker=current_ticker,
+                    baseline=market_baseline_btc,
+                    final_btc=final_btc,
+                    variation=final_variation,
+                    side=last_side or "none",
+                    price=last_price or 0.0,
+                    filled=traded_this_market,
+                    outcome=outcome
+                )
+
+        # Reset state for new market
         current_ticker = ticker
         traded_this_market = False
         market_baseline_btc = None
+        last_side = None
+        last_price = None
 
         try:
             baseline = float(floor_strike) if floor_strike else None
@@ -367,6 +432,9 @@ while True:
 
     # Place order if signal triggered
     if side and price and price > 0:
+        last_side = side
+        last_price = price
+
         balance_cents = get_balance_cents()
         risk_dollars = min((balance_cents / 100.0) * RISK_FRACTION, MAX_ORDER_DOLLARS)
         count = max(1, int(risk_dollars * 100) // int(price * 100))
@@ -380,7 +448,7 @@ while True:
 
         if not DRY_RUN:
             filled = place_market_order(ticker, side, count, price)
-            traded_this_market = True  # mark as traded regardless of fill result
+            traded_this_market = True
             if filled:
                 logger.info("✅ Trade complete — waiting for next market")
             else:
