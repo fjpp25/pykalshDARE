@@ -25,24 +25,36 @@ CHECK_INTERVAL_SECONDS = 2
 RISK_FRACTION = 0.25
 MAX_ORDER_DOLLARS = 50.0
 
-PRICE_CEILING = 0.82
+PRICE_CEILING = 0.88
 PRICE_FLOOR = 0.25
 
 TRIGGER_AT_SECONDS = 480
 MIN_SECONDS_TO_TRADE = 25
 
 # ---- Dynamic threshold (Brownian motion formula) ----
-# σ of 1-min BTC returns, as a fraction (not percent).
-# Calibrated from log session: 0.000491. Raise for conservative sizing.
-SIGMA_PER_MIN = 0.000491
-
 # Confidence level: probability that price does NOT reverse before expiry.
 # 0.95 → z=1.96 | 0.99 → z=2.576
 CONFIDENCE = 0.95
 
-# Fat-tail multiplier: BTC has heavier tails than Gaussian (kurtosis ~2.5).
-# 1.0 = pure Gaussian. Recommended: 1.3–1.5 for live trading.
-FAT_TAIL_MULTIPLIER = 1.4
+# Session-aware σ calibration (1-min close-to-close returns, overnight run).
+# Each entry: (sigma_per_min, fat_tail_multiplier)
+#   sigma_per_min     — σ of 1-min BTC returns as a fraction (not percent)
+#   fat_tail_multiplier — kurtosis adjustment; 1.0 = pure Gaussian
+#
+# Recalibrate periodically by sharing btc_prices.csv for re-analysis.
+#
+#  session    UTC hours   σ/min       kurtosis   fat-tail
+#  ---------  ---------   ----------  ---------  --------
+#  asia       00–05       0.000301    2.26        1.23
+#  europe     06–11       0.000256    2.34        1.23
+#  us         12–19       0.000491    ~2.5        1.40   ← yesterday only, needs more data
+#  us_close   20–23       0.000491    ~2.5        1.40   ← yesterday only, needs more data
+SESSION_SIGMA: dict[str, tuple[float, float]] = {
+    "asia":     (0.000301, 1.23),
+    "europe":   (0.000256, 1.23),
+    "us":       (0.000491, 1.40),
+    "us_close": (0.000491, 1.40),
+}
 
 DRY_RUN = False
 
@@ -90,16 +102,22 @@ def get_threshold(seconds_left: float) -> float | None:
 
     where:
         z  = inverse-normal quantile for the chosen confidence level
-        σ  = calibrated 1-min BTC volatility (SIGMA_PER_MIN)
-        k  = fat-tail multiplier to account for BTC's excess kurtosis
+        σ  = session-aware 1-min BTC volatility (from SESSION_SIGMA)
+        k  = session-aware fat-tail multiplier
         t  = minutes remaining (continuous)
+
+    σ and k are selected based on the current UTC hour so the threshold
+    adapts to intraday volatility patterns (asia > europe in this dataset).
 
     Returns None if outside the [MIN_SECONDS_TO_TRADE, TRIGGER_AT_SECONDS] window.
     """
     if seconds_left > TRIGGER_AT_SECONDS or seconds_left < MIN_SECONDS_TO_TRADE:
         return None
+    utc_hour = datetime.now(timezone.utc).hour
+    session = _get_session(utc_hour)
+    sigma, fat_tail = SESSION_SIGMA[session]
     minutes_left = seconds_left / 60.0
-    threshold_fraction = _Z * SIGMA_PER_MIN * FAT_TAIL_MULTIPLIER * math.sqrt(minutes_left)
+    threshold_fraction = _Z * sigma * fat_tail * math.sqrt(minutes_left)
     return threshold_fraction * 100.0  # return as percent, matching btc_variation units
 
 
@@ -558,4 +576,3 @@ while True:
             traded_this_market = True
 
     time.sleep(CHECK_INTERVAL_SECONDS)
-
