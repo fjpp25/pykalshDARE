@@ -1,6 +1,7 @@
 import time
 import logging
 import sys
+import math
 import requests
 import uuid
 import csv
@@ -30,9 +31,23 @@ PRICE_FLOOR = 0.25
 TRIGGER_AT_SECONDS = 480
 MIN_SECONDS_TO_TRADE = 25
 
+# ---- Dynamic threshold (Brownian motion formula) ----
+# σ of 1-min BTC returns, as a fraction (not percent).
+# Calibrated from log session: 0.000491. Raise for conservative sizing.
+SIGMA_PER_MIN = 0.000491
+
+# Confidence level: probability that price does NOT reverse before expiry.
+# 0.95 → z=1.96 | 0.99 → z=2.576
+CONFIDENCE = 0.95
+
+# Fat-tail multiplier: BTC has heavier tails than Gaussian (kurtosis ~2.5).
+# 1.0 = pure Gaussian. Recommended: 1.3–1.5 for live trading.
+FAT_TAIL_MULTIPLIER = 1.4
+
 DRY_RUN = False
 
 RESULTS_FILE = "trade_results.csv"
+PRICES_FILE  = "btc_prices.csv"
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -50,25 +65,42 @@ session = requests.Session()
 
 
 # ====================== HELPERS ======================
-def get_threshold(seconds_left: float):
+def _norm_ppf(p: float) -> float:
     """
-    Returns the BTC move threshold required to trigger a trade,
-    based on how much time is left. Ceiling is fixed — it does
-    not rise as time runs out.
-    Returns None if outside the trading window.
+    Rational approximation of the inverse normal CDF (Abramowitz & Stegun).
+    Accurate to ~3e-4 — sufficient for threshold sizing.
+    """
+    a = (2.515517, 0.802853, 0.010328)
+    b = (1.432788, 0.189269, 0.001308)
+    t = math.sqrt(-2.0 * math.log(p if p < 0.5 else 1.0 - p))
+    z = t - (a[0] + t * (a[1] + t * a[2])) / (1.0 + t * (b[0] + t * (b[1] + t * b[2])))
+    return -z if p < 0.5 else z
+
+
+# Pre-compute the z-score once at startup
+_Z = _norm_ppf(1.0 - (1.0 - CONFIDENCE) / 2.0)
+
+
+def get_threshold(seconds_left: float) -> float | None:
+    """
+    Dynamic threshold: minimum |BTC Δ%| required to enter a trade given
+    the time remaining, derived from the Brownian first-passage formula:
+
+        Δ_min(t) = z * σ * k * √t
+
+    where:
+        z  = inverse-normal quantile for the chosen confidence level
+        σ  = calibrated 1-min BTC volatility (SIGMA_PER_MIN)
+        k  = fat-tail multiplier to account for BTC's excess kurtosis
+        t  = minutes remaining (continuous)
+
+    Returns None if outside the [MIN_SECONDS_TO_TRADE, TRIGGER_AT_SECONDS] window.
     """
     if seconds_left > TRIGGER_AT_SECONDS or seconds_left < MIN_SECONDS_TO_TRADE:
         return None
-    elif seconds_left > 360:   # 8–6 min out
-        return 0.25
-    elif seconds_left > 240:   # 6–4 min out
-        return 0.20
-    elif seconds_left > 180:   # 4–3 min out
-        return 0.15
-    elif seconds_left > 120:   # 3–2 min out
-        return 0.10
-    else:                      # last 2 min
-        return 0.05
+    minutes_left = seconds_left / 60.0
+    threshold_fraction = _Z * SIGMA_PER_MIN * FAT_TAIL_MULTIPLIER * math.sqrt(minutes_left)
+    return threshold_fraction * 100.0  # return as percent, matching btc_variation units
 
 
 def get_btc_price() -> float | None:
@@ -86,6 +118,18 @@ def get_btc_price() -> float | None:
         return None
 
 
+def _get_session(utc_hour: int) -> str:
+    """Map UTC hour to a named trading session for segmentation."""
+    if 0 <= utc_hour < 6:
+        return "asia"
+    elif 6 <= utc_hour < 12:
+        return "europe"
+    elif 12 <= utc_hour < 20:
+        return "us"
+    else:
+        return "us_close"
+
+
 def log_market_result(
     ticker: str,
     baseline: float,
@@ -96,18 +140,30 @@ def log_market_result(
     filled: bool,
     outcome: str
 ):
-    """Log the result of a completed market to CSV"""
+    """Log the result of a completed market to CSV.
+
+    Extra columns for overnight calibration:
+      utc_hour  — hour of day (0-23 UTC) for time-of-day σ segmentation
+      session   — asia / europe / us / us_close
+    """
     try:
+        now = datetime.now(timezone.utc)
+        utc_hour = now.hour
+        session = _get_session(utc_hour)
+
         file_exists = os.path.exists(RESULTS_FILE)
         with open(RESULTS_FILE, "a", newline="") as f:
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow([
-                    "timestamp", "ticker", "baseline_btc", "final_btc",
+                    "timestamp", "utc_hour", "session",
+                    "ticker", "baseline_btc", "final_btc",
                     "variation_pct", "side", "price", "filled", "outcome"
                 ])
             writer.writerow([
-                datetime.now().isoformat(),
+                now.isoformat(),
+                utc_hour,
+                session,
                 ticker,
                 round(baseline, 2),
                 round(final_btc, 2),
@@ -120,6 +176,48 @@ def log_market_result(
         logger.info(f"📊 Logged result for {ticker}: {outcome} | BTC Δ={variation:.3f}% | side={side} | price={price}")
     except Exception as e:
         logger.error(f"Failed to log market result: {e}")
+
+
+def log_btc_tick(btc_price: float, ticker: str, seconds_left: float, baseline: float):
+    """Log every BTC price observation to btc_prices.csv for σ calibration.
+
+    Columns:
+      timestamp        — ISO UTC timestamp
+      utc_hour         — hour of day (0-23) for time-of-day segmentation
+      session          — asia / europe / us / us_close
+      ticker           — active Kalshi market
+      seconds_left     — time remaining in current market window
+      btc_price        — raw BTC/USDT spot price from Binance
+      baseline_btc     — market floor_strike (target price)
+      variation_pct    — (btc_price - baseline) / baseline * 100
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        utc_hour = now.hour
+        session = _get_session(utc_hour)
+        variation_pct = round((btc_price - baseline) / baseline * 100, 4)
+
+        file_exists = os.path.exists(PRICES_FILE)
+        with open(PRICES_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp", "utc_hour", "session",
+                    "ticker", "seconds_left", "btc_price",
+                    "baseline_btc", "variation_pct"
+                ])
+            writer.writerow([
+                now.isoformat(),
+                utc_hour,
+                session,
+                ticker,
+                round(seconds_left, 1),
+                btc_price,
+                baseline,
+                variation_pct
+            ])
+    except Exception as e:
+        logger.error(f"Failed to log BTC tick: {e}")
 
 
 # ====================== AUTH SIGNING ======================
@@ -405,6 +503,8 @@ while True:
         time.sleep(CHECK_INTERVAL_SECONDS)
         continue
 
+    log_btc_tick(btc_price, ticker, seconds_left, market_baseline_btc)
+
     btc_variation = (btc_price - market_baseline_btc) / market_baseline_btc * 100
     yes_price, no_price = get_orderbook_prices(ticker)
     logger.info(
@@ -458,3 +558,4 @@ while True:
             traded_this_market = True
 
     time.sleep(CHECK_INTERVAL_SECONDS)
+
