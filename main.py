@@ -30,28 +30,16 @@ PRICE_FLOOR = 0.25
 TRIGGER_AT_SECONDS = 480
 MIN_SECONDS_TO_TRADE = 25
 
-# ---- Dynamic threshold (power-law Brownian formula) ----
-# Δ_min(t) = z * σ * k * t^α
-# where t is in minutes, σ and α are session-aware.
+# ---- Dynamic threshold ----
 CONFIDENCE = 0.95
 
 # Session-aware σ calibration.
 # Each entry: (sigma_per_min, fat_tail_multiplier, alpha)
 #   sigma_per_min       — σ of 1-min BTC returns as a fraction
-#   fat_tail_multiplier — kurtosis adjustment; 1.0 = pure Gaussian
+#   fat_tail_multiplier — kurtosis adjustment
 #   alpha               — power-law exponent (0.5 = pure Brownian)
-#                         > 0.5 means trending behaviour
 #
-# Defaults are from overnight run analysis.
-# σ and α are recalibrated automatically from btc_prices.csv
-# once SIGMA_MIN_SAMPLES rows are available per session.
-#
-#  session    UTC hours   σ/min       fat-tail   α
-#  ---------  ---------   ----------  --------   ----
-#  asia       00–05       0.000301    1.23       0.50  ← α not yet fitted, using √t
-#  europe     06–11       0.000256    1.23       0.50  ← α not yet fitted, using √t
-#  us         12–19       0.000491    1.40       0.50  ← needs more data
-#  us_close   20–23       0.000491    1.40       0.50  ← needs more data
+# These defaults are used until SIGMA_MIN_SAMPLES rows exist per session.
 SESSION_SIGMA: dict[str, tuple[float, float, float]] = {
     "asia":     (0.000301, 1.23, 0.50),
     "europe":   (0.000256, 1.23, 0.50),
@@ -59,13 +47,12 @@ SESSION_SIGMA: dict[str, tuple[float, float, float]] = {
     "us_close": (0.000491, 1.40, 0.50),
 }
 
-# Minimum rows per session in btc_prices.csv before σ/α recalibration kicks in
+# Minimum rows per session before calibration runs
 SIGMA_MIN_SAMPLES = 200
 
 # ---- Kelly criterion ----
-# Minimum filled trades per side before Kelly sizing replaces fixed fallback.
-KELLY_MIN_SAMPLES = 30
-KELLY_FALLBACK     = 0.10   # conservative fraction until enough data
+KELLY_MIN_SAMPLES  = 30
+KELLY_FALLBACK     = 0.10
 KELLY_MIN_FRACTION = 0.05
 KELLY_MAX_FRACTION = 0.30
 
@@ -104,7 +91,7 @@ session = requests.Session()
 def _norm_ppf(p: float) -> float:
     """
     Rational approximation of the inverse normal CDF (Abramowitz & Stegun).
-    Accurate to ~3e-4 — sufficient for threshold sizing.
+    Accurate to ~3e-4.
     """
     a = (2.515517, 0.802853, 0.010328)
     b = (1.432788, 0.189269, 0.001308)
@@ -114,7 +101,6 @@ def _norm_ppf(p: float) -> float:
     return -z if p < 0.5 else z
 
 
-# Pre-compute the z-score once at startup
 _Z = _norm_ppf(1.0 - (1.0 - CONFIDENCE) / 2.0)
 
 
@@ -130,91 +116,156 @@ def _get_session(utc_hour: int) -> str:
         return "us_close"
 
 
+def get_btc_price() -> float | None:
+    """Fetch current BTC/USDT spot price from Binance."""
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": "BTCUSDT"},
+            timeout=5
+        )
+        resp.raise_for_status()
+        return float(resp.json()["price"])
+    except Exception as e:
+        logger.error(f"Failed to fetch BTC price: {e}")
+        return None
+
+
 # ====================== SIGMA CALIBRATION ======================
 def calibrate_session_sigma() -> None:
     """
-    Fit σ and α per session from btc_prices.csv using the model:
+    Estimate σ per session directly from the standard deviation of
+    per-minute BTC returns observed in btc_prices.csv.
 
-        |Δ%| = z * σ * k * t^α
+    Method:
+      1. For each session, collect consecutive (ticker, seconds_left,
+         variation_pct) rows that belong to the same market.
+      2. Compute the minute-to-minute change in variation_pct as a
+         proxy for the 1-minute return.
+      3. σ = std(minute_returns) — this is the true per-minute volatility.
+      4. α is estimated via OLS on log(|variation|) ~ log(minutes_elapsed)
+         using only observations where the market has been running for
+         at least 1 minute, to avoid the noisy near-zero early ticks.
 
-    Rearranging:
-        log(|Δ%| / (z * k)) = log(σ) + α * log(t)
+    k (fat-tail multiplier) is kept fixed — it's a theoretical adjustment,
+    not a data-fitted parameter.
 
-    This is a simple OLS linear regression in log-log space.
-    Updates SESSION_SIGMA in-place if enough data is available.
-    Skips sessions with fewer than SIGMA_MIN_SAMPLES rows.
+    Updates SESSION_SIGMA in-place. Skips sessions with fewer than
+    SIGMA_MIN_SAMPLES rows.
     """
     if not os.path.exists(PRICES_FILE):
         return
 
     try:
-        # Load prices file
-        rows_by_session: dict[str, list[tuple[float, float]]] = {
-            "asia": [], "europe": [], "us": [], "us_close": []
-        }
+        # ── Step 1: load all rows grouped by session ──
+        from collections import defaultdict
+        session_rows: dict[str, list[dict]] = defaultdict(list)
 
         with open(PRICES_FILE, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
                     sess = row["session"]
-                    t_min = float(row["seconds_left"]) / 60.0
-                    var = abs(float(row["variation_pct"]))
-                    if t_min > 0 and var > 0 and sess in rows_by_session:
-                        rows_by_session[sess].append((t_min, var))
+                    if sess in SESSION_SIGMA:
+                        session_rows[sess].append({
+                            "ticker":       row["ticker"],
+                            "seconds_left": float(row["seconds_left"]),
+                            "variation":    float(row["variation_pct"]) / 100.0,
+                            "btc_price":    float(row["btc_price"]),
+                        })
                 except (KeyError, ValueError):
                     continue
 
-        for sess, data in rows_by_session.items():
-            if len(data) < SIGMA_MIN_SAMPLES:
+        for sess, rows in session_rows.items():
+            if len(rows) < SIGMA_MIN_SAMPLES:
                 logger.info(
                     f"  σ calibration ({sess}): "
-                    f"{len(data)} samples < {SIGMA_MIN_SAMPLES} — skipping"
+                    f"{len(rows)} samples < {SIGMA_MIN_SAMPLES} — skipping"
                 )
                 continue
 
-            t_vals = [d[0] for d in data]
-            v_vals = [d[1] for d in data]
-
             current_sigma, current_k, current_alpha = SESSION_SIGMA[sess]
 
-            # Transform to log-log space: log(v / (z * k)) = log(σ) + α * log(t)
-            # We keep k fixed (fat-tail multiplier doesn't change with more data)
-            # and fit only σ and α via OLS.
-            log_t = [math.log(t) for t in t_vals]
-            log_v = [
-                math.log(v / (_Z * current_k))
-                for v in v_vals
-            ]
+            # ── Step 2: compute minute-to-minute returns ──
+            # Group by ticker so we don't diff across market boundaries
+            minute_returns: list[float] = []
+            by_ticker: dict[str, list[dict]] = defaultdict(list)
+            for r in rows:
+                by_ticker[r["ticker"]].append(r)
 
-            # OLS: fit log_v = log_sigma + alpha * log_t
-            n = len(log_t)
-            sum_t = sum(log_t)
-            sum_v = sum(log_v)
-            sum_tt = sum(x * x for x in log_t)
-            sum_tv = sum(x * y for x, y in zip(log_t, log_v))
+            for ticker_rows in by_ticker.values():
+                # Sort by seconds_left descending (earliest first)
+                ticker_rows.sort(key=lambda x: x["seconds_left"], reverse=True)
+                prices = [r["btc_price"] for r in ticker_rows]
+                times  = [r["seconds_left"] for r in ticker_rows]
 
-            denom = n * sum_tt - sum_t * sum_t
-            if abs(denom) < 1e-12:
+                # Compute returns between observations ~60s apart
+                for i in range(1, len(prices)):
+                    dt = times[i - 1] - times[i]  # seconds between obs
+                    if 50 <= dt <= 70:  # roughly 1-minute gap
+                        ret = (prices[i] - prices[i - 1]) / prices[i - 1]
+                        minute_returns.append(ret)
+
+            if len(minute_returns) < 10:
+                logger.info(
+                    f"  σ calibration ({sess}): "
+                    f"insufficient minute-return pairs — skipping"
+                )
                 continue
 
-            alpha_fit = (n * sum_tv - sum_t * sum_v) / denom
-            log_sigma_fit = (sum_v - alpha_fit * sum_t) / n
-            sigma_fit = math.exp(log_sigma_fit)
+            # ── Step 3: σ = std of minute returns ──
+            n = len(minute_returns)
+            mean_r = sum(minute_returns) / n
+            variance = sum((r - mean_r) ** 2 for r in minute_returns) / (n - 1)
+            sigma_fit = math.sqrt(variance)
 
-            # Clamp to sensible ranges
-            alpha_fit = max(0.3, min(2.0, alpha_fit))
-            sigma_fit = max(1e-6, min(0.01, sigma_fit))
+            # ── Step 4: fit α via OLS on log-log ──
+            # Use only rows where minutes_elapsed > 1 (i.e. seconds_left < 840)
+            # and variation is meaningfully non-zero (> 0.01%)
+            alpha_data = [
+                r for r in rows
+                if r["seconds_left"] < 840
+                and abs(r["variation"]) > 0.0001
+            ]
 
-            old = SESSION_SIGMA[sess]
+            alpha_fit = current_alpha  # fallback if not enough data
+
+            if len(alpha_data) >= 50:
+                # minutes elapsed = (900 - seconds_left) / 60
+                log_t = [
+                    math.log(max((900 - r["seconds_left"]) / 60.0, 0.1))
+                    for r in alpha_data
+                ]
+                log_v = [
+                    math.log(abs(r["variation"]) / (current_k))
+                    for r in alpha_data
+                ]
+
+                m = len(log_t)
+                s_t  = sum(log_t)
+                s_v  = sum(log_v)
+                s_tt = sum(x * x for x in log_t)
+                s_tv = sum(x * y for x, y in zip(log_t, log_v))
+                denom = m * s_tt - s_t * s_t
+
+                if abs(denom) > 1e-12:
+                    alpha_raw = (m * s_tv - s_t * s_v) / denom
+                    # Clamp α to a sensible range
+                    alpha_fit = max(0.3, min(1.5, alpha_raw))
+
+            # Clamp σ to a sensible range
+            sigma_fit = max(1e-5, min(0.005, sigma_fit))
+
+            old_sigma, old_k, old_alpha = SESSION_SIGMA[sess]
             SESSION_SIGMA[sess] = (sigma_fit, current_k, alpha_fit)
 
             logger.info(
                 f"  σ calibrated ({sess}): "
-                f"σ {old[0]:.6f}→{sigma_fit:.6f} | "
-                f"α {old[2]:.3f}→{alpha_fit:.3f} | "
+                f"σ {old_sigma:.6f}→{sigma_fit:.6f} | "
+                f"α {old_alpha:.3f}→{alpha_fit:.3f} | "
                 f"k={current_k:.2f} | "
-                f"n={n}"
+                f"n_rows={len(rows)} | "
+                f"n_returns={len(minute_returns)}"
             )
 
     except Exception as e:
@@ -224,20 +275,12 @@ def calibrate_session_sigma() -> None:
 # ====================== DYNAMIC THRESHOLD ======================
 def get_threshold(seconds_left: float) -> float | None:
     """
-    Dynamic threshold: minimum |BTC Δ%| required to enter a trade given
-    the time remaining, derived from the power-law Brownian formula:
+    Dynamic threshold: minimum |BTC Δ%| required to enter a trade.
 
         Δ_min(t) = z * σ * k * t^α
 
-    where:
-        z  = inverse-normal quantile for the chosen confidence level
-        σ  = session-aware 1-min BTC volatility (from SESSION_SIGMA)
-        k  = session-aware fat-tail multiplier
-        α  = power-law exponent (fitted from data; >0.5 = trending)
-        t  = minutes remaining (continuous)
-
-    Returns None if outside the [MIN_SECONDS_TO_TRADE, TRIGGER_AT_SECONDS]
-    window.
+    where t is minutes remaining.
+    Returns None if outside the trading window.
     """
     if seconds_left > TRIGGER_AT_SECONDS or seconds_left < MIN_SECONDS_TO_TRADE:
         return None
@@ -247,14 +290,14 @@ def get_threshold(seconds_left: float) -> float | None:
     sigma, fat_tail, alpha = SESSION_SIGMA[sess]
     minutes_left = seconds_left / 60.0
     threshold_fraction = _Z * sigma * fat_tail * (minutes_left ** alpha)
-    return threshold_fraction * 100.0  # return as percent
+    return threshold_fraction * 100.0
 
 
 # ====================== KELLY CRITERION ======================
 def calculate_kelly_fraction(side: str) -> float:
     """
     Calculate half-Kelly fraction from historical trade results.
-    Tracks YES and NO separately since edge may differ per side.
+    Tracks YES and NO separately.
     Falls back to KELLY_FALLBACK if insufficient data.
     """
     if not os.path.exists(RESULTS_FILE):
@@ -267,7 +310,7 @@ def calculate_kelly_fraction(side: str) -> float:
     try:
         wins = 0
         losses = 0
-        total_win_pnl = 0.0
+        total_win_pnl  = 0.0
         total_loss_pnl = 0.0
 
         with open(RESULTS_FILE, "r") as f:
@@ -288,18 +331,16 @@ def calculate_kelly_fraction(side: str) -> float:
             return KELLY_FALLBACK
 
         for row in rows:
-            price = float(row["price"])
+            price   = float(row["price"])
             outcome = row["outcome"]
             if price <= 0:
                 continue
-            # Win: collected (1 - price) per dollar risked
-            # Loss: lost price per dollar risked
             if outcome == "win":
                 wins += 1
                 total_win_pnl += (1.0 - price) / price
             else:
                 losses += 1
-                total_loss_pnl += 1.0   # lost full stake
+                total_loss_pnl += 1.0
 
         total = wins + losses
         if total == 0 or wins == 0 or losses == 0:
@@ -309,9 +350,9 @@ def calculate_kelly_fraction(side: str) -> float:
             )
             return KELLY_FALLBACK
 
-        win_prob  = wins / total
-        avg_win   = total_win_pnl / wins
-        avg_loss  = total_loss_pnl / losses
+        win_prob = wins / total
+        avg_win  = total_win_pnl / wins
+        avg_loss = total_loss_pnl / losses
 
         b     = avg_win / avg_loss
         p     = win_prob
@@ -340,7 +381,7 @@ def calculate_kelly_fraction(side: str) -> float:
 
 # ====================== AUTH SIGNING ======================
 def sign_request(method: str, path: str) -> dict:
-    """Generate Kalshi RSA-PSS signed headers"""
+    """Generate Kalshi RSA-PSS signed headers."""
     timestamp_ms = str(int(time.time() * 1000))
     message = timestamp_ms + method.upper() + path
     signature = private_key.sign(
@@ -362,7 +403,7 @@ def sign_request(method: str, path: str) -> dict:
 
 # ====================== API FUNCTIONS ======================
 def get_current_market():
-    """Get the soonest-closing open KXBTC15M market, with retry logic"""
+    """Get the soonest-closing open KXBTC15M market, with retry logic."""
     for attempt in range(1, 6):
         try:
             url = f"{BASE_URL}/markets"
@@ -388,7 +429,7 @@ def get_current_market():
 
 
 def get_orderbook_prices(market_ticker: str):
-    """Get best YES/NO ask prices from the orderbook"""
+    """Get best YES/NO ask prices from the orderbook."""
     try:
         url = f"{BASE_URL}/markets/{market_ticker}/orderbook"
         resp = session.get(url, timeout=8)
@@ -396,9 +437,9 @@ def get_orderbook_prices(market_ticker: str):
         data = resp.json()
         ob = data.get("orderbook_fp", {})
         yes_levels = ob.get("yes_dollars", [])
-        no_levels = ob.get("no_dollars", [])
+        no_levels  = ob.get("no_dollars",  [])
         yes_ask = float(yes_levels[-1][0]) if yes_levels else 0.0
-        no_ask = float(no_levels[-1][0]) if no_levels else 0.0
+        no_ask  = float(no_levels[-1][0])  if no_levels  else 0.0
         return yes_ask, no_ask
     except Exception as e:
         logger.error(f"Orderbook error {market_ticker}: {e}")
@@ -406,7 +447,7 @@ def get_orderbook_prices(market_ticker: str):
 
 
 def get_balance_cents() -> int:
-    """Fetch live account balance in cents"""
+    """Fetch live account balance in cents."""
     try:
         path = "/trade-api/v2/portfolio/balance"
         headers = sign_request("GET", path)
@@ -430,10 +471,7 @@ def place_market_order(
     count: int,
     price: float
 ) -> bool:
-    """
-    Place an aggressive limit IOC order.
-    Adds a buffer to cross the spread and fill immediately.
-    """
+    """Place an aggressive limit IOC order."""
     try:
         path = "/trade-api/v2/portfolio/orders"
         headers = sign_request("POST", path)
@@ -441,25 +479,25 @@ def place_market_order(
         price_cents = int(round(price * 100))
 
         if side == "yes":
-            if price_cents >= 95:
-                yes_price_cents = 99
-            else:
-                yes_price_cents = min(price_cents + 5, 99)
+            yes_price_cents = (
+                99 if price_cents >= 95
+                else min(price_cents + 5, 99)
+            )
         else:
-            if price_cents >= 95:
-                yes_price_cents = 1
-            else:
-                yes_price_cents = max(100 - price_cents - 5, 1)
+            yes_price_cents = (
+                1 if price_cents >= 95
+                else max(100 - price_cents - 5, 1)
+            )
 
         order_payload = {
-            "action": "buy",
-            "client_order_id": str(uuid.uuid4()),
-            "count": count,
-            "side": side,
-            "ticker": market_ticker,
-            "type": "limit",
-            "yes_price": yes_price_cents,
-            "time_in_force": "immediate_or_cancel",
+            "action":           "buy",
+            "client_order_id":  str(uuid.uuid4()),
+            "count":            count,
+            "side":             side,
+            "ticker":           market_ticker,
+            "type":             "limit",
+            "yes_price":        yes_price_cents,
+            "time_in_force":    "immediate_or_cancel",
         }
 
         logger.info(f"Placing order: {order_payload}")
@@ -470,15 +508,11 @@ def place_market_order(
             timeout=10
         )
         resp.raise_for_status()
-        result = resp.json()
-
-        order = result.get("order", {})
+        result  = resp.json()
+        order   = result.get("order", {})
         order_id = order.get("order_id", "unknown")
-        status = order.get("status", "unknown")
-        logger.info(
-            f"Order response → ID: {order_id} | Status: {status}"
-        )
-
+        status   = order.get("status",   "unknown")
+        logger.info(f"Order response → ID: {order_id} | Status: {status}")
         return wait_for_fill(order_id)
 
     except requests.HTTPError as e:
@@ -492,8 +526,8 @@ def place_market_order(
 
 
 def wait_for_fill(order_id: str, timeout_seconds: int = 10) -> bool:
-    """Poll order status until filled, canceled, or timeout"""
-    path = f"/trade-api/v2/portfolio/orders/{order_id}"
+    """Poll order status until filled, canceled, or timeout."""
+    path     = f"/trade-api/v2/portfolio/orders/{order_id}"
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
@@ -505,7 +539,7 @@ def wait_for_fill(order_id: str, timeout_seconds: int = 10) -> bool:
                 timeout=8
             )
             resp.raise_for_status()
-            order = resp.json().get("order", {})
+            order  = resp.json().get("order", {})
             status = order.get("status")
             filled = order.get("filled_count", 0)
             logger.info(
@@ -546,9 +580,9 @@ def log_market_result(
 ):
     """Log the result of a completed market to CSV."""
     try:
-        now = datetime.now(timezone.utc)
+        now      = datetime.now(timezone.utc)
         utc_hour = now.hour
-        sess = _get_session(utc_hour)
+        sess     = _get_session(utc_hour)
 
         file_exists = os.path.exists(RESULTS_FILE)
         with open(RESULTS_FILE, "a", newline="") as f:
@@ -560,17 +594,12 @@ def log_market_result(
                     "variation_pct", "side", "price", "filled", "outcome"
                 ])
             writer.writerow([
-                now.isoformat(),
-                utc_hour,
-                sess,
+                now.isoformat(), utc_hour, sess,
                 ticker,
                 round(baseline, 2),
                 round(final_btc, 2),
                 round(variation, 4),
-                side,
-                price,
-                filled,
-                outcome
+                side, price, filled, outcome
             ])
         logger.info(
             f"📊 Logged result for {ticker}: {outcome} | "
@@ -588,9 +617,9 @@ def log_btc_tick(
 ):
     """Log every BTC price observation to btc_prices.csv."""
     try:
-        now = datetime.now(timezone.utc)
+        now      = datetime.now(timezone.utc)
         utc_hour = now.hour
-        sess = _get_session(utc_hour)
+        sess     = _get_session(utc_hour)
         variation_pct = round((btc_price - baseline) / baseline * 100, 4)
 
         file_exists = os.path.exists(PRICES_FILE)
@@ -603,13 +632,10 @@ def log_btc_tick(
                     "baseline_btc", "variation_pct"
                 ])
             writer.writerow([
-                now.isoformat(),
-                utc_hour,
-                sess,
+                now.isoformat(), utc_hour, sess,
                 ticker,
                 round(seconds_left, 1),
-                btc_price,
-                baseline,
+                btc_price, baseline,
                 variation_pct
             ])
     except Exception as e:
@@ -617,23 +643,20 @@ def log_btc_tick(
 
 
 # ===================== STATE =====================
-current_ticker  = None
+current_ticker      = None
 market_baseline_btc = None
 traded_this_market  = False
-last_side  = None
-last_price = None
+last_side           = None
+last_price          = None
 
 
 # ===================== STARTUP ======================
-# Calibrate σ and α from existing data before the first market
 calibrate_session_sigma()
 
-# Log the current threshold curve so you can verify at startup
 logger.info("Threshold curve at startup:")
 logger.info(f"  {'Session':<10} {'Time left':>10} | {'Threshold':>10}")
 logger.info(f"  {'-'*36}")
-utc_h = datetime.now(timezone.utc).hour
-_sess_now = _get_session(utc_h)
+_sess_now = _get_session(datetime.now(timezone.utc).hour)
 for t_s in [480, 360, 300, 240, 180, 120, 60, 30]:
     thr = get_threshold(t_s)
     logger.info(f"  {_sess_now:<10} {t_s:>9}s | {thr:>9.3f}%")
@@ -649,9 +672,9 @@ while True:
         time.sleep(CHECK_INTERVAL_SECONDS)
         continue
 
-    ticker = market.get("ticker")
+    ticker         = market.get("ticker")
     close_time_str = market.get("close_time")
-    floor_strike = (
+    floor_strike   = (
         market.get("floor_strike") or
         market.get("result_sources", [{}])[0].get("floor_strike")
     )
@@ -690,7 +713,7 @@ while True:
                     outcome=outcome
                 )
 
-        # Recalibrate σ/α on every new market using latest CSV data
+        # Recalibrate on every new market
         calibrate_session_sigma()
 
         # Reset state
@@ -818,7 +841,6 @@ while True:
         last_side  = side
         last_price = price
 
-        # Kelly sizing
         kelly_fraction = calculate_kelly_fraction(side)
         balance_cents  = get_balance_cents()
         risk_dollars   = min(
