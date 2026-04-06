@@ -24,14 +24,21 @@ CHECK_INTERVAL_SECONDS = 2
 
 MAX_ORDER_DOLLARS = 50.0
 
-PRICE_CEILING = 0.88
-PRICE_FLOOR = 0.25
+PRICE_CEILING = 0.92   # raised: early entries have prices 0.55-0.75, room to go higher
+PRICE_FLOOR   = 0.20   # lowered slightly: allows cheap NO entries on strong downmoves
 
-TRIGGER_AT_SECONDS = 480
+# Entry window — open at 13 min, close at 25s
+# Data shows 87.5% momentum persistence from early phase → prices still reasonable
+TRIGGER_AT_SECONDS  = 780
 MIN_SECONDS_TO_TRADE = 25
 
 # ---- Dynamic threshold ----
-CONFIDENCE = 0.95
+# Clamped between a floor (avoids noise) and a ceiling (avoids missing the window).
+# Data shows threshold > 0.10% blocks 86% of valid signals because the market
+# has already repriced. Floor of 0.05% captures early momentum.
+CONFIDENCE         = 0.90   # relaxed from 0.95 — we enter earlier so less certainty needed
+MIN_THRESHOLD_PCT  = 0.05   # never trade below this regardless of formula output
+MAX_THRESHOLD_PCT  = 0.12   # never demand more than this — above 0.10% market is already priced in
 
 SESSION_SIGMA: dict[str, tuple[float, float, float]] = {
     "asia":     (0.000301, 1.23, 0.50),
@@ -312,6 +319,12 @@ def get_threshold(seconds_left: float, sess: str) -> float | None:
     """
     Δ_min(t) = z * σ * k * t^α  where t = minutes remaining.
     Session locked at candle open.
+
+    Clamped between MIN_THRESHOLD_PCT and MAX_THRESHOLD_PCT:
+    - Floor (0.05%): filters pure noise, early momentum is meaningful above this
+    - Ceiling (0.12%): above 0.10% the market has already repriced — data shows
+      86% of those observations have YES ask > 0.88, blocking the trade anyway
+
     Returns None if outside the trading window.
     """
     if (
@@ -321,8 +334,8 @@ def get_threshold(seconds_left: float, sess: str) -> float | None:
         return None
     sigma, fat_tail, alpha = SESSION_SIGMA[sess]
     minutes_left = seconds_left / 60.0
-    threshold_fraction = _Z * sigma * fat_tail * (minutes_left ** alpha)
-    return threshold_fraction * 100.0
+    raw = _Z * sigma * fat_tail * (minutes_left ** alpha) * 100.0
+    return max(MIN_THRESHOLD_PCT, min(MAX_THRESHOLD_PCT, raw))
 
 
 # ====================== KELLY CRITERION ======================
@@ -719,12 +732,15 @@ position_took_profit = False
 calibrate_session_sigma()
 
 logger.info("Threshold curve at startup:")
-logger.info(f"  {'Session':<10} {'Time left':>10} | {'Threshold':>10}")
-logger.info(f"  {'-'*36}")
+logger.info(f"  {'Session':<10} {'Time left':>10} | {'Threshold':>10} | {'Raw formula':>12}")
+logger.info(f"  {'-'*48}")
 _startup_sess = _get_session(datetime.now(timezone.utc).hour)
-for t_s in [480, 360, 300, 240, 180, 120, 60, 30]:
-    thr = get_threshold(t_s, _startup_sess)
-    logger.info(f"  {_startup_sess:<10} {t_s:>9}s | {thr:>9.3f}%")
+for t_s in [780, 600, 480, 360, 300, 240, 180, 120, 60, 30]:
+    sigma, fat_tail, alpha = SESSION_SIGMA[_startup_sess]
+    raw = _Z * sigma * fat_tail * ((t_s / 60.0) ** alpha) * 100.0
+    clamped = get_threshold(t_s, _startup_sess)
+    clamp_note = " (floor)" if raw < MIN_THRESHOLD_PCT else " (cap)" if raw > MAX_THRESHOLD_PCT else ""
+    logger.info(f"  {_startup_sess:<10} {t_s:>9}s | {clamped:>9.3f}% | {raw:>10.3f}%{clamp_note}")
 
 
 # ===================== MAIN LOOP =====================
@@ -936,7 +952,7 @@ while True:
         if seconds_left > TRIGGER_AT_SECONDS:
             logger.info(
                 f"  ⏳ {seconds_left:.0f}s left — "
-                f"waiting for <8 min window to open"
+                f"waiting for <13 min window to open"
             )
         time.sleep(CHECK_INTERVAL_SECONDS)
         continue
