@@ -1,0 +1,22 @@
+# KXBTC15M Threshold Momentum Bot — Python dependencies
+#
+# Install all at once:
+#   pip install -r requirements.txt
+#
+# Python 3.11+ required (uses X | Y union types and sys.stdlib_module_names).
+
+# Kalshi API authentication (RSA-PSS request signing)
+cryptography==46.0.6
+
+# HTTP client — Kalshi REST API, BTC price fallback feeds
+requests==2.33.1
+
+# Live BRTI price feed (wss://www.cfbenchmarks.com/ws/v4)
+websockets==16.0
+
+# Data analysis — backtesting, CSV handling, trade history
+pandas==3.0.2
+
+# Monitor UI
+PyQt6==6.11.0
+matplotlib==3.10.8
