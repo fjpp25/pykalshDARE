@@ -66,7 +66,7 @@ DRY_RUN = os.environ.get("KALSHI_DRY_RUN", "true").lower() != "false"
 
 # Strategy parameters — single source of truth in config.py
 from config import (
-    FIXED_RISK_DOLLARS, MAX_CONTRACTS, MAX_ENTRY_PRICE,
+    FIXED_RISK_DOLLARS, MAX_CONTRACTS, MIN_ENTRY_PRICE, MAX_ENTRY_PRICE,
     DAILY_LOSS_LIMIT, get_threshold,
 )
 
@@ -734,6 +734,14 @@ while True:
 
     if entry_price <= 0:
         logger.warning(f"  Entry price is zero for {signal_side} — skipping")
+        time.sleep(2)
+        continue
+
+    if entry_price < MIN_ENTRY_PRICE:
+        logger.info(
+            f"  Entry price ${entry_price:.4f} below MIN_ENTRY_PRICE "
+            f"${MIN_ENTRY_PRICE} — market already priced against us, skipping"
+        )
         time.sleep(2)
         continue
 

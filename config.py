@@ -17,6 +17,7 @@ import os as _os
 # Switch to Kelly sizing once KELLY_MIN_SAMPLES real trades are logged.
 FIXED_RISK_DOLLARS = 6.0    # dollars at risk per trade
 MAX_CONTRACTS      = 8      # hard cap — safety net for very cheap entries
+MIN_ENTRY_PRICE    = 0.50   # skip entries below this — market has already decided against us
 MAX_ENTRY_PRICE    = 0.985  # skip entries above this — IOC liquidity dries up
 DAILY_LOSS_LIMIT   = -20.0  # stop trading for the UTC day if P&L hits this
 
@@ -41,11 +42,11 @@ def get_threshold(seconds_left: float) -> float:
         3–5min   0.175 %  →  98.2 %
         5–15min  0.350 %  →  96.8 %
     """
-    if seconds_left <= 30:  return 0.015
-    if seconds_left <= 60:  return 0.070
-    if seconds_left <= 120: return 0.087
-    if seconds_left <= 180: return 0.147
-    if seconds_left <= 300: return 0.173
+    if seconds_left <= 30:  return 0.018
+    if seconds_left <= 65:  return 0.068
+    if seconds_left <= 125: return 0.085
+    if seconds_left <= 180: return 0.145
+    if seconds_left <= 305: return 0.170
     return 0.350
 
 

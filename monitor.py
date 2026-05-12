@@ -54,6 +54,7 @@ from PyQt6.QtGui import QColor, QFont, QPalette, QBrush
 # ─────────────────────────────────────────────────────────────
 RESULTS_FILE  = "trade_results.csv"
 PRICES_FILE   = "btc_prices.csv"
+CACHE_FILE    = "trade_history_cache.csv"   # local cache of pre-today Kalshi settlements
 POLL_INTERVAL = 2000          # ms between live data refreshes
 CHART_REFRESH = 10000         # ms between chart redraws
 CSV_REFRESH   = 5000          # ms between CSV reloads
@@ -64,7 +65,7 @@ SERIES_TICKER = "KXBTC15M"
 
 # Strategy parameters — single source of truth in config.py
 from config import (
-    FIXED_RISK_DOLLARS, MAX_CONTRACTS, MAX_ENTRY_PRICE,
+    FIXED_RISK_DOLLARS, MAX_CONTRACTS, MIN_ENTRY_PRICE, MAX_ENTRY_PRICE,
     DAILY_LOSS_LIMIT, get_threshold, THRESHOLD_TABLE,
 )
 
@@ -217,23 +218,23 @@ class DataWorker(QThread):
         cycle = 0
         while self._running:
             try:
-                self._poll_btc()          # every 2s — Coinbase/Kraken/Bitstamp fallback chain
+                self._poll_btc()          # every 2s — CF Benchmarks WS + exchange fallback
             except Exception as e:
                 self.error.emit(f"BTC poll: {e}")
 
-            if cycle % 10 == 0:           # every 20s — market changes every 15min
+            if cycle % 20 == 0:           # every 40s — market changes every 15min
                 try:
                     self._poll_market()
                 except Exception as e:
                     self.error.emit(f"Market poll: {e}")
 
-            if cycle % 30 == 0 and self._kalshi_ok:   # every 60s
+            if cycle % 60 == 0 and self._kalshi_ok:   # every 2min
                 try:
                     self._poll_balance()
                 except Exception:
                     pass
 
-            if (cycle == 0 or cycle % 60 == 0) and self._kalshi_ok:   # immediately + every 2min
+            if (cycle == 0 or cycle % 300 == 0) and self._kalshi_ok:   # startup + every 10min
                 try:
                     self._poll_pnl_since_may()
                 except Exception as e:
@@ -332,16 +333,39 @@ class DataWorker(QThread):
         if not self._sign:
             return
 
-        MIN_TS    = 1746057600  # May 1 2026 00:00:00 UTC
-        all_setts = []
-        cursor    = None
+        MAY1_TS  = 1746057600   # May 1 2026 00:00:00 UTC — hard floor
+        today_utc = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        today_str = today_utc.strftime("%Y-%m-%d")
+        today_ts  = int(today_utc.timestamp())
 
+        # ── Load pre-today trades from local cache if available ──
+        cached_trades: list[dict] = []
+        cached_tickers: set[str]  = set()
+        if os.path.exists(CACHE_FILE):
+            try:
+                import pandas as _pd
+                cache_df = _pd.read_csv(CACHE_FILE)
+                pre_today = cache_df[cache_df["timestamp"] < today_str]
+                cached_trades  = pre_today.to_dict("records")
+                cached_tickers = {t["ticker"] for t in cached_trades}
+                print(f"[Cache] Loaded {len(cached_trades)} pre-today trades from {CACHE_FILE}")
+            except Exception as e:
+                print(f"[Cache] Load error: {e}")
+                cached_trades  = []
+                cached_tickers = set()
+
+        # ── Fetch from Kalshi — only today if cache exists, else from May 1 ──
+        fetch_from_ts = today_ts if cached_trades else MAY1_TS
+        fetch_from_str = today_str if cached_trades else "2026-05"
+        print(f"[Kalshi P&L] Fetching settlements from "
+              f"{'today' if cached_trades else 'May 1'} onwards...")
+
+        all_setts: list[dict] = []
+        cursor = None
         for _ in range(50):
-            # Use only min_ts for server-side filtering — the ticker param on
-            # /portfolio/settlements filters by exact market ticker, not series
-            # prefix, so passing "KXBTC15M" would return nothing.
-            # min_ts limits pages to post-May data only, keeping pagination short.
-            params = {"limit": 200, "min_ts": MIN_TS}
+            params = {"limit": 200, "min_ts": fetch_from_ts}
             if cursor:
                 params["cursor"] = cursor
             try:
@@ -353,35 +377,28 @@ class DataWorker(QThread):
                 data   = r.json()
                 batch  = data.get("settlements", [])
                 cursor = data.get("cursor")
-                # Filter client-side: KXBTC15M only, settled May 2026 onwards.
-                # min_ts isn't reliably applied server-side so we enforce it here.
                 kxbtc  = [
                     s for s in batch
                     if s.get("ticker", "").startswith(SERIES_TICKER)
-                    and s.get("settled_time", "") >= "2026-05"
+                    and s.get("settled_time", "") >= fetch_from_str
                 ]
                 all_setts.extend(kxbtc)
-                print(f"[Kalshi P&L] page: {len(batch)} settlements, {len(kxbtc)} KXBTC15M May+")
-
-                # Stop once we see pre-May settlements — implies we've gone past
-                # the relevant date range (assuming newest-first ordering).
-                has_pre_may = any(s.get("settled_time", "") < "2026-05" for s in batch)
-                if not batch or not cursor or has_pre_may:
+                print(f"[Kalshi P&L] page: {len(batch)} settlements, {len(kxbtc)} KXBTC15M")
+                has_pre_fetch = any(
+                    s.get("settled_time", "") < fetch_from_str for s in batch
+                )
+                if not batch or not cursor or has_pre_fetch:
                     break
                 time.sleep(0.2)
             except Exception as e:
                 print(f"[Kalshi P&L] Settlement fetch error: {e}")
                 break
 
-        if not all_setts:
-            print("[Kalshi P&L] No KXBTC15M settlements found from May 2026 onwards")
-            self.pnl_updated.emit(0.0, [])
-            return
-
-        total_pnl = 0.0
-        trades    = []
-
+        # ── Parse fresh settlements from Kalshi ──
+        fresh_trades: list[dict] = []
         for s in all_setts:
+            if s.get("ticker", "") in cached_tickers:
+                continue   # already in cache, skip duplicate
             ticker  = s.get("ticker", "")
             result  = s.get("market_result", "")
             settled = s.get("settled_time", "")
@@ -416,8 +433,7 @@ class DataWorker(QThread):
                     outcome = "unknown"
                     pnl     = 0.0
 
-                total_pnl += pnl
-                trades.append({
+                fresh_trades.append({
                     "ticker":    ticker,
                     "timestamp": settled,
                     "session":   sess,
@@ -429,9 +445,36 @@ class DataWorker(QThread):
                     "pnl":       round(pnl, 4),
                 })
 
+        # ── Update cache: add any fresh pre-today settled trades ──
+        pre_today_fresh = [
+            t for t in fresh_trades
+            if t["timestamp"] < today_str
+            and t["outcome"] in ("win", "loss")
+            and t["ticker"] not in cached_tickers
+        ]
+        if pre_today_fresh:
+            try:
+                import pandas as _pd
+                all_pre_today = cached_trades + pre_today_fresh
+                _pd.DataFrame(all_pre_today).to_csv(CACHE_FILE, index=False)
+                print(f"[Cache] Updated {CACHE_FILE} — "
+                      f"{len(all_pre_today)} pre-today trades total")
+            except Exception as e:
+                print(f"[Cache] Save error: {e}")
+
+        # ── Combine and emit ──
+        trades    = cached_trades + fresh_trades
+        total_pnl = sum(t["pnl"] for t in trades)
+
+        if not trades:
+            print("[Kalshi P&L] No KXBTC15M settlements found")
+            self.pnl_updated.emit(0.0, [])
+            return
+
         settled_count = sum(1 for t in trades if t["outcome"] in ("win", "loss"))
         print(f"[Kalshi P&L] {len(trades)} positions | {settled_count} settled "
-              f"| net P&L: ${total_pnl:+.4f}")
+              f"| net P&L: ${total_pnl:+.4f} "
+              f"({len(cached_trades)} cached + {len(fresh_trades)} fresh)")
         self.pnl_updated.emit(total_pnl, trades)
 
 
@@ -462,6 +505,7 @@ class BotWorker(QThread):
         self._baseline_btc        = None
         self._market_session      = None
         self._traded_this_market  = False
+        self._failed_attempts     = 0   # consecutive IOC failures this candle
         self._last_side           = None
         self._last_price          = None
         self._last_filled_count   = 0
@@ -553,6 +597,8 @@ class BotWorker(QThread):
                 headers=headers, json=payload, timeout=10,
             )
             post_ms = (time.time() - t_post) * 1000
+            if post_ms > 800:
+                self._log(f"  ⚠️ Slow POST: {post_ms:.0f}ms — order may arrive late")
 
             # Log full response so we can diagnose issues
             try:
@@ -574,10 +620,16 @@ class BotWorker(QThread):
                 return False, 0
 
             # Poll for fill
+            # Short initial delay — Kalshi's read service (query-exchange) takes
+            # ~1-2s to index a newly created order. Polling immediately causes
+            # a flood of 404s that fills the log and wastes cycles.
+            time.sleep(1.5)
+
             deadline    = time.time() + 12
             path_o      = f"/trade-api/v2/portfolio/orders/{order_id}"
             last_status = None
-            executed_at = float("inf")  # set when executed+filled=0 first seen
+            executed_at = float("inf")
+            consec_404  = 0
 
             while time.time() < deadline:
                 try:
@@ -587,6 +639,7 @@ class BotWorker(QThread):
                         headers=h2, timeout=8,
                     )
                     ro.raise_for_status()
+                    consec_404 = 0  # reset on success
                     o      = ro.json().get("order", {})
                     status = o.get("status")
                     filled = int(o.get("filled_count", 0))
@@ -596,15 +649,11 @@ class BotWorker(QThread):
                         self._log(f"  Poll: status={status} | filled={filled}")
                         last_status = status
                         if status in ("executed", "filled") and filled == 0:
-                            executed_at = time.time()   # start grace period clock
+                            executed_at = time.time()
 
                     if status in ("filled", "executed"):
                         if filled > 0:
                             return True, filled
-                        # executed + filled=0: Kalshi may not have updated
-                        # filled_count yet even though the position was created.
-                        # Give it 2s, then verify against /portfolio/positions
-                        # before declaring failure.
                         if time.time() - executed_at > 2.0:
                             actual = self._check_position(ticker)
                             if actual > 0:
@@ -628,16 +677,29 @@ class BotWorker(QThread):
                         reason = o.get("close_reason", "unknown")
                         self._log(f"  ❌ Order rejected: {reason}")
                         return False, 0
-                    # "resting", "open", "pending" → keep waiting
 
                 except requests.HTTPError as e:
-                    self._log(f"  Poll error: {e.response.status_code} — {e.response.text[:100]}")
+                    sc = e.response.status_code
+                    if sc == 404:
+                        consec_404 += 1
+                        if consec_404 == 1:
+                            self._log(f"  Order not yet indexed (404) — waiting...")
+                        # Don't log every 404 — they're expected briefly after creation
+                    else:
+                        self._log(f"  Poll error: {sc} — {e.response.text[:100]}")
                 except Exception as e:
                     self._log(f"  Poll error: {e}")
 
                 time.sleep(0.5)
 
-            self._log(f"  ⏱ Fill timeout — last status: {last_status}")
+            # Timeout — check position before giving up in case the order
+            # filled but the status endpoint was unreachable (e.g. sustained 404s)
+            self._log(f"  ⏱ Fill timeout — last status: {last_status} — checking position")
+            actual = self._check_position(ticker)
+            if actual > 0:
+                self._log(f"  ✅ Position confirmed via /positions after timeout: {actual} contracts")
+                return True, actual
+            self._log(f"  ⏱ Fill timeout — confirmed no position")
             return False, 0
 
         except requests.HTTPError as e:
@@ -843,6 +905,7 @@ class BotWorker(QThread):
             # If we have an open position from a previous session, don't re-enter.
             already = ticker in getattr(self, "_already_traded", set())
             self._traded_this_market = already
+            self._failed_attempts    = 0
             if already:
                 self._log(f"  ↩ {ticker} already has an open position — skipping entry")
             self._last_side          = None
@@ -911,7 +974,14 @@ class BotWorker(QThread):
             f"signal={signal_side or 'WAIT'} | mid={mid_yes:.3f}"
         )
 
-        if self._traded_this_market or signal_side is None:
+        if self._traded_this_market:
+            return
+        if signal_side is None:
+            return
+
+        # After 2 consecutive IOC failures on this candle, stop trying.
+        # The market has indicated no liquidity — further attempts waste time.
+        if self._failed_attempts >= 2:
             return
 
         # Don't enter with less than 10 seconds left — order won't fill in time.
@@ -931,6 +1001,13 @@ class BotWorker(QThread):
         entry_price = yes_price if signal_side == "yes" else no_price
         if entry_price <= 0:
             self._log(f"  ⚠️ Entry price zero for {signal_side} — skipping")
+            return
+
+        if entry_price < MIN_ENTRY_PRICE:
+            self._log(
+                f"  ⏭ Entry price ${entry_price:.4f} < min ${MIN_ENTRY_PRICE} "
+                f"— market already priced against us, skipping"
+            )
             return
 
         if entry_price > MAX_ENTRY_PRICE:
@@ -968,7 +1045,11 @@ class BotWorker(QThread):
                 )
                 self.trade_placed.emit(ticker, signal_side, filled_count, entry_price)
             else:
-                self._log(f"⚠️ Order not filled | {elapsed:.2f}s elapsed")
+                self._failed_attempts += 1
+                self._log(
+                    f"⚠️ Order not filled | {elapsed:.2f}s elapsed "
+                    f"| attempt {self._failed_attempts}/2"
+                )
         else:
             self._traded_this_market = True
             self._last_filled_count  = count
@@ -1211,6 +1292,9 @@ class TradeHistoryPanel(QWidget):
         super().__init__()
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        self._df: pd.DataFrame = pd.DataFrame()
 
         self._table = QTableWidget(0, len(HISTORY_COLS))
         self._table.setHorizontalHeaderLabels(HISTORY_HEADERS)
@@ -1220,18 +1304,46 @@ class TradeHistoryPanel(QWidget):
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSortingEnabled(False)
-        # Increase font size for readability
         font = QFont()
-        font.setPointSize(13)   # ~1.75x the default
+        font.setPointSize(13)
         self._table.setFont(font)
         self._table.horizontalHeader().setFont(font)
-        self._table.verticalHeader().setDefaultSectionSize(34)  # taller rows for larger font
+        self._table.verticalHeader().setDefaultSectionSize(34)
         lay.addWidget(self._table)
+
+        # ── Download row ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._export_btn = QPushButton("⬇  EXPORT CSV")
+        self._export_btn.setFixedWidth(160)
+        self._export_btn.setEnabled(False)
+        self._export_btn.clicked.connect(self._export_csv)
+        self._export_lbl = QLabel("")
+        self._export_lbl.setStyleSheet("color: #4b5563; font-size: 10px;")
+        btn_row.addWidget(self._export_lbl)
+        btn_row.addWidget(self._export_btn)
+        lay.addLayout(btn_row)
+
+    def _export_csv(self):
+        if self._df.empty:
+            return
+        try:
+            from datetime import datetime as _dt
+            filename = f"trade_history_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            self._df.sort_values("timestamp", ascending=False).to_csv(filename, index=False)
+            self._export_lbl.setText(f"Saved → {filename}")
+        except Exception as e:
+            self._export_lbl.setText(f"Export failed: {e}")
 
     def refresh(self, df: pd.DataFrame):
         if df is None or df.empty:
             self._table.setRowCount(0)
+            self._export_btn.setEnabled(False)
             return
+
+        self._df = df.copy()
+        self._export_btn.setEnabled(True)
+        self._export_lbl.setText("")
 
         df_sorted = df.sort_values("timestamp", ascending=False).reset_index(drop=True)
         n_rows = len(df_sorted)
@@ -1334,16 +1446,19 @@ class PnLPanel(QWidget):
         if settled.empty:
             return
 
-        # Compute P&L per trade: win=(1-price)*count, loss=(-price)*count
-        def row_pnl(r):
-            try:
-                price = float(r["price"])
-                count = int(r["filled_count"])
-                return (1 - price) * count if r["outcome"] == "win" else -price * count
-            except Exception:
-                return 0.0
-
-        settled["pnl"] = settled.apply(row_pnl, axis=1)
+        # Use pre-computed pnl (fee-inclusive, from Kalshi) when available.
+        # Fall back to recomputing from price/count only when pnl column is absent.
+        if "pnl" in settled.columns and pd.to_numeric(settled["pnl"], errors="coerce").notna().any():
+            settled["pnl"] = pd.to_numeric(settled["pnl"], errors="coerce").fillna(0.0)
+        else:
+            def row_pnl(r):
+                try:
+                    price = float(r["price"])
+                    count = float(r["filled_count"])
+                    return (1 - price) * count if r["outcome"] == "win" else -price * count
+                except Exception:
+                    return 0.0
+            settled["pnl"] = settled.apply(row_pnl, axis=1)
         settled["timestamp"] = pd.to_datetime(settled["timestamp"], utc=True)
         settled = settled.sort_values("timestamp")
         settled["cum_pnl"] = settled["pnl"].cumsum()
@@ -1410,7 +1525,7 @@ class AnalyticsPanel(QWidget):
         self._canvas = MplCanvas(nrows=2, ncols=2, height=5.5)
         lay.addWidget(self._canvas)
 
-    def refresh(self, df: pd.DataFrame):
+    def refresh(self, df: pd.DataFrame, csv_df: pd.DataFrame = None):
         if df is None or df.empty or "outcome" not in df.columns:
             return
 
@@ -1423,7 +1538,7 @@ class AnalyticsPanel(QWidget):
             ax.clear()
             apply_dark_axes(ax, self._canvas.fig)
 
-        # ── Win rate by session ──
+        # ── axes[0]: Win rate by session ──
         ax0 = axes[0]
         sessions = ["asia", "europe", "us", "us_close"]
         wr_vals, n_vals = [], []
@@ -1442,36 +1557,81 @@ class AnalyticsPanel(QWidget):
                      f"{wr:.0f}%\n(n={n})", ha="center", va="bottom",
                      fontsize=8, color="#6b7280")
 
-        # ── Win rate by entry time bucket ──
+        # ── axes[1]: P&L by entry time window ──
+        # Uses Kalshi df (authoritative 55 trades + PnL) joined with
+        # entry_seconds_left from csv_df on ticker — never inflates counts.
         ax1 = axes[1]
+        ax1.set_title("P&L by entry window", fontsize=10, color="#9ca3af", pad=6)
+        windows_drawn = False
         try:
-            settled["entry_seconds_left"] = pd.to_numeric(settled["entry_seconds_left"], errors="coerce")
-            buckets = [(0,60,"0-60s"),(60,180,"1-3m"),(180,300,"3-5m"),
-                       (300,480,"5-8m"),(480,660,"8-11m"),(660,900,"11-15m")]
-            labels, wrs, ns = [], [], []
-            for lo, hi, lbl in buckets:
-                sub = settled[
-                    (settled["entry_seconds_left"] >= lo) &
-                    (settled["entry_seconds_left"] < hi)
-                ]
-                if len(sub) > 0:
-                    labels.append(lbl)
-                    wrs.append((sub["outcome"] == "win").mean() * 100)
-                    ns.append(len(sub))
-            bars2 = ax1.bar(range(len(labels)), wrs, color="#3b82f6", alpha=0.75, width=0.5, zorder=3)
-            ax1.set_xticks(range(len(labels)))
-            ax1.set_xticklabels(labels, fontsize=9)
-            ax1.set_ylim(0, 110)
-            ax1.axhline(100, color=CHART_GRID, linewidth=0.6, linestyle="--")
-            ax1.set_title("win rate by entry time", fontsize=10, color="#9ca3af", pad=6)
-            for bar, wr, n in zip(bars2, wrs, ns):
-                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                         f"{wr:.0f}%\n(n={n})", ha="center", va="bottom",
-                         fontsize=8, color="#6b7280")
+            win_df = settled.copy()
+            # Enrich with entry_seconds_left from CSV if available
+            if (csv_df is not None and not csv_df.empty
+                    and "entry_seconds_left" in csv_df.columns
+                    and "ticker" in csv_df.columns):
+                sl_map = (
+                    csv_df[csv_df["ticker"].notna()]
+                    .dropna(subset=["entry_seconds_left"])
+                    .groupby("ticker")["entry_seconds_left"]
+                    .first()
+                )
+                win_df["entry_seconds_left"] = win_df["ticker"].map(sl_map)
+            else:
+                win_df["entry_seconds_left"] = float("nan")
+
+            win_df["entry_seconds_left"] = pd.to_numeric(
+                win_df["entry_seconds_left"], errors="coerce"
+            )
+            win_df["pnl"] = pd.to_numeric(win_df["pnl"], errors="coerce").fillna(0.0)
+            has_sl = win_df["entry_seconds_left"].notna().any()
+
+            win_bins = [
+                (15,  35,  "0-35s"),
+                (35,  65,  "35-65s"),
+                (65,  125, "1-2min"),
+                (125, 185, "2-3min"),
+                (185, 305, "3-5min"),
+                (305, 900, "5-15min"),
+            ]
+            labels2, pnls2, ns2 = [], [], []
+            if has_sl:
+                for lo, hi, lbl in win_bins:
+                    sub = win_df[
+                        (win_df["entry_seconds_left"] >= lo) &
+                        (win_df["entry_seconds_left"] < hi)
+                    ]
+                    if len(sub) == 0:
+                        continue
+                    labels2.append(lbl)
+                    pnls2.append(sub["pnl"].sum())
+                    ns2.append(len(sub))
+
+            if labels2:
+                colors2 = [C_YES if v >= 0 else C_NO for v in pnls2]
+                bars2   = ax1.bar(range(len(labels2)), pnls2,
+                                  color=colors2, alpha=0.75, width=0.5, zorder=3)
+                ax1.set_xticks(range(len(labels2)))
+                ax1.set_xticklabels(labels2, fontsize=8, rotation=20, ha="right")
+                ax1.axhline(0, color=CHART_GRID, linewidth=0.8)
+                ax1.set_ylabel("total P&L ($)", fontsize=9, color=CHART_TEXT)
+                for bar, pv, n in zip(bars2, pnls2, ns2):
+                    va  = "bottom" if pv >= 0 else "top"
+                    off = max(abs(pv) * 0.03, 0.002)
+                    ax1.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        pv + (off if pv >= 0 else -off),
+                        f"${pv:+.2f}\n(n={n})",
+                        ha="center", va=va, fontsize=8, color="#6b7280",
+                    )
+                windows_drawn = True
         except Exception:
             pass
+        if not windows_drawn:
+            ax1.text(0.5, 0.5, "no entry time data\n(trade_results.csv)",
+                     ha="center", va="center", fontsize=9,
+                     color=CHART_TEXT, transform=ax1.transAxes)
 
-        # ── YES vs NO breakdown ──
+        # ── axes[2]: YES vs NO win rate ──
         ax2 = axes[2]
         yes_s = settled[settled["side"] == "yes"]
         no_s  = settled[settled["side"] == "no"]
@@ -1486,21 +1646,36 @@ class AnalyticsPanel(QWidget):
             ax2.text(x, wr + 1, f"{wr:.1f}%\n(n={n})", ha="center", va="bottom",
                      fontsize=9, color="#6b7280")
 
-        # ── Variation distribution at signal ──
+        # ── axes[3]: P&L by session (from Kalshi data) ──
         ax3 = axes[3]
+        ax3.set_title("P&L by session", fontsize=10, color="#9ca3af", pad=6)
         try:
-            settled["variation_pct"] = pd.to_numeric(settled["variation_pct"], errors="coerce")
-            yes_var = settled[settled["side"] == "yes"]["variation_pct"].dropna()
-            no_var  = settled[settled["side"] == "no"]["variation_pct"].dropna()
-            if len(yes_var) > 0:
-                ax3.hist(yes_var, bins=20, color=C_YES, alpha=0.6, label="YES entries", zorder=3)
-            if len(no_var) > 0:
-                ax3.hist(no_var, bins=20, color=C_NO,  alpha=0.6, label="NO entries",  zorder=3)
-            ax3.axvline(0, color=CHART_GRID, linewidth=0.8)
-            ax3.set_xlabel("variation % at entry", fontsize=9, color=CHART_TEXT)
-            ax3.set_title("variation distribution", fontsize=10, color="#9ca3af", pad=6)
-            ax3.legend(fontsize=8, facecolor=CHART_SURF, edgecolor=CHART_GRID,
-                       labelcolor="#9ca3af")
+            all_trades = df.copy()
+            all_trades["pnl"] = pd.to_numeric(all_trades["pnl"], errors="coerce").fillna(0.0)
+            # Group by session dynamically — no trades dropped due to unexpected session values
+            sess_order = ["asia", "europe", "us", "us_close"]
+            sess_present = [s for s in sess_order if s in all_trades["session"].values]
+            pnl_vals, pnl_ns = [], []
+            for s in sess_present:
+                sub = all_trades[all_trades["session"] == s]
+                pnl_vals.append(sub["pnl"].sum())
+                pnl_ns.append(len(sub))
+            colors3 = [C_YES if v >= 0 else C_NO for v in pnl_vals]
+            bars3   = ax3.bar(sess_present, pnl_vals,
+                              color=colors3, alpha=0.75, width=0.5, zorder=3)
+            ax3.axhline(0, color=CHART_GRID, linewidth=0.8)
+            ax3.set_ylabel("total P&L ($)", fontsize=9, color=CHART_TEXT)
+            for bar, pv, n in zip(bars3, pnl_vals, pnl_ns):
+                if n == 0:
+                    continue
+                va  = "bottom" if pv >= 0 else "top"
+                off = max(abs(pv) * 0.03, 0.002)
+                ax3.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    pv + (off if pv >= 0 else -off),
+                    f"${pv:+.2f}\n(n={n})",
+                    ha="center", va=va, fontsize=8, color="#6b7280",
+                )
         except Exception:
             pass
 
@@ -1860,7 +2035,7 @@ class MainWindow(QMainWindow):
         if tab == 2:
             self._pnl_panel.refresh(df)
         elif tab == 3:
-            self._analytics.refresh(df)
+            self._analytics.refresh(df, self._df)
 
     def _on_tab_changed(self, idx: int):
         df = self._kalshi_data()
@@ -1869,7 +2044,7 @@ class MainWindow(QMainWindow):
         elif idx == 2:
             self._pnl_panel.refresh(df)
         elif idx == 3:
-            self._analytics.refresh(df)
+            self._analytics.refresh(df, self._df)
 
     def _on_toggle_trading(self, active: bool):
         self._sidebar.set_trading_active(active)
@@ -1922,7 +2097,7 @@ class MainWindow(QMainWindow):
         if tab == 2:
             self._pnl_panel.refresh(df)
         elif tab == 3:
-            self._analytics.refresh(df)
+            self._analytics.refresh(df, self._df)
 
     def _on_btc(self, price: float):
         self._btc_price = price
